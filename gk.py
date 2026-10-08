@@ -1,860 +1,425 @@
-
-import streamlit as st
-import requests
-from bs4 import BeautifulSoup
-from itertools import combinations
+import math
+import re
 from collections import Counter
-import numpy as np
+from datetime import datetime, timedelta, timezone
+from itertools import combinations
+from zoneinfo import ZoneInfo
+
 import matplotlib.pyplot as plt
-import seaborn as sns
+import numpy as np
 import pandas as pd
+import requests
+import seaborn as sns
+import streamlit as st
+from bs4 import BeautifulSoup
 
-# =====================
-# STREAMLIT CONFIG
-# =====================
-st.set_page_config(
-    page_title="Greek Kino Analyzer PRO",
-    page_icon="🎯",
-    layout="wide"
-)
 
-# =====================
-# FETCH DATA
-# =====================
-@st.cache_data(ttl=300)
-def fetch_kino_results(url, max_draws):
+st.set_page_config(page_title="Greek Kino Analyzer PRO", page_icon="🎯", layout="wide")
+ATHENS = ZoneInfo("Europe/Athens")
+GRKINO_URL = "https://grkino.com/arhiva.php"
+
+
+# ==============================================
+# PREUZIMANJE REZULTATA (NOVIJI PRVO)
+# ==============================================
+def valid_draw(numbers):
+    return (
+        isinstance(numbers, list)
+        and len(numbers) == 20
+        and len(set(numbers)) == 20
+        and all(type(n) is int and 1 <= n <= 80 for n in numbers)
+    )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_opap_day(day_iso):
+    url = f"https://api.opap.gr/draws/v3.0/1100/draw-date/{day_iso}/{day_iso}"
+    response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("content"), list):
+        raise ValueError("OPAP nije vratio ocekivani format podataka.")
+
+    result = []
+    for item in payload["content"]:
+        nums = item.get("winningNumbers", {}).get("list", [])
+        if not valid_draw(nums):
+            continue
+
+        timestamp = item.get("drawTime")
+        if not isinstance(timestamp, (int, float)):
+            continue
+
+        local_dt = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc).astimezone(ATHENS)
+        result.append({
+            "numbers": nums,
+            "timestamp": int(timestamp),
+            "date": local_dt.strftime("%d.%m.%Y %H:%M"),
+            "id": str(item.get("drawId", int(timestamp))),
+        })
+    return result
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_grkino_archive():
+    response = requests.get(GRKINO_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    sections = re.split(r"\bExtragere\b", soup.get_text(separator="\n"))[1:]
+    result = []
+
+    for section in sections:
+        lines = [line.strip() for line in section.splitlines() if line.strip()]
+        heading = " ".join(lines[:3])
+        match = re.search(r"(\d{2}:\d{2}:\d{2})\s+(\d{2}\.\d{2}\.\d{4})", heading)
+        if not match:
+            continue
+
+        nums = [int(line) for line in lines if re.fullmatch(r"\d{1,2}", line)]
+        nums = nums[:20]
+        if not valid_draw(nums):
+            continue
+
+        dt = datetime.strptime(f"{match.group(2)} {match.group(1)}", "%d.%m.%Y %H:%M:%S")
+        local_dt = dt.replace(tzinfo=ATHENS)
+        result.append({
+            "numbers": nums,
+            "timestamp": int(local_dt.timestamp() * 1000),
+            "date": local_dt.strftime("%d.%m.%Y %H:%M"),
+            "id": local_dt.isoformat(),
+        })
+
+    return result
+
+
+def newest_unique(draws, n):
+    result = []
+    seen = set()
+    for item in sorted(draws, key=lambda x: x["timestamp"], reverse=True):
+        if item["id"] not in seen:
+            seen.add(item["id"])
+            result.append(item)
+        if len(result) >= n:
+            break
+    return result
+
+
+def load_draws(n):
+    """Prvo OPAP (vise dana), a zatim GrKino ako OPAP nije dostupan."""
+    collected = []
+    warning = ""
+    empty_days = 0
+    today = datetime.now(ATHENS).date()
+    days_to_check = min(180, max(10, math.ceil(n / 100) + 10))
+
     try:
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        draws = []
-
-        sections = soup.get_text(separator="\n").split("Extragere")[1:]
-
-        for section in sections:
-            if len(draws) >= max_draws:
+        for offset in range(days_to_check):
+            day = today - timedelta(days=offset)
+            daily = fetch_opap_day(day.isoformat())
+            if daily:
+                empty_days = 0
+                collected.extend(daily)
+            else:
+                empty_days += 1
+                if empty_days >= 3:
+                    break
+            if len(collected) >= n:
                 break
+    except (requests.RequestException, ValueError, TypeError, KeyError, OverflowError) as e:
+        warning = f"OPAP pristup nije potpuno uspeo: {e}"
 
-            lines = [
-                l.strip()
-                for l in section.split("\n")
-                if l.strip()
-            ]
+    if collected:
+        if warning:
+            warning += " Prikazuju se samo vec preuzeti rezultati."
+        return newest_unique(collected, n), "OPAP API", warning
 
-            nums = []
-
-            for line in lines[1:]:
-                for p in line.split():
-                    if p.isdigit():
-                        nums.append(int(p))
-
-            # Validno KINO izvlacenje: 20 jedinstvenih brojeva 1-80
-            if (
-                len(nums) == 20
-                and len(set(nums)) == 20
-                and all(1 <= n <= 80 for n in nums)
-            ):
-                draws.append(nums)
-
-        return draws
-
-    except requests.RequestException as e:
-        st.error(f"Greska prilikom ucitavanja podataka: {e}")
-        return []
+    try:
+        result = newest_unique(fetch_grkino_archive(), n)
+        return result, "GrKino (rezervni izvor)", (
+            "OPAP nije dostupan; rezervna arhiva mozda nema dovoljno rezultata "
+            "za trazeni N. " + warning
+        )
+    except (requests.RequestException, ValueError) as e:
+        return [], "", f"Nije moguce ucitati podatke: {e}. {warning}"
 
 
-# =====================
-# COMBINATIONS
-# =====================
-def analyze_kino(draws, M, K):
+# ==============================================
+# KOMBINACIJE
+# ==============================================
+def analyze_kino(draws, m, k):
     counter = Counter()
-
-    for draw in draws:
-        for combo in combinations(sorted(draw), M):
+    for item in draws:
+        for combo in combinations(sorted(item["numbers"]), m):
             counter[combo] += 1
-
-    return [
-        (c, cnt)
-        for c, cnt in counter.items()
-        if cnt > K
-    ]
+    return sorted(((c, cnt) for c, cnt in counter.items() if cnt > k), key=lambda x: -x[1])
 
 
-# =====================
-# MATRIX UTILS
-# =====================
-def number_to_matrix_pos(num, rows, cols):
+# ==============================================
+# MATRICE
+# ==============================================
+def number_to_matrix_pos(num, cols):
     return (num - 1) // cols, (num - 1) % cols
 
 
-def draw_single_matrix(draw, rows, cols):
+def draw_single_matrix(numbers, rows, cols):
     matrix = np.zeros((rows, cols))
-
-    for num in draw:
-        r, c = number_to_matrix_pos(num, rows, cols)
+    for num in numbers:
+        r, c = number_to_matrix_pos(num, cols)
         matrix[r, c] = 1
-
     return matrix
 
 
-# =====================
-# MATRIX ANALYSIS
-# =====================
 def matrix_analysis(draws, rows, cols, br, bc):
+    overlay = np.zeros((rows, cols))
     counts = Counter()
-
-    heatmap_counts = np.zeros((rows, cols))
-
-    heatmap_numbers = np.arange(
-        1, rows * cols + 1
-    ).reshape(rows, cols)
-
-    for draw in draws:
-        positions = [
-            number_to_matrix_pos(n, rows, cols)
-            for n in draw
-        ]
-
+    for item in draws:
+        positions = {number_to_matrix_pos(n, cols) for n in item["numbers"]}
         for r, c in positions:
-            heatmap_counts[r, c] += 1
-
+            overlay[r, c] += 1
         for rs in range(rows - br + 1):
             for cs in range(cols - bc + 1):
-
-                block = {
-                    (rs + i, cs + j)
-                    for i in range(br)
-                    for j in range(bc)
-                }
-
-                hits = sum(
-                    1 for p in positions if p in block
-                )
-
-                counts[(rs, cs)] += hits
-
-    max_block, max_hits = (
-        counts.most_common(1)[0]
-        if counts
-        else (None, 0)
-    )
-
-    return (
-        heatmap_counts,
-        heatmap_numbers,
-        max_block,
-        max_hits
-    )
+                block = {(rs + i, cs + j) for i in range(br) for j in range(bc)}
+                counts[(rs, cs)] += len(block & positions)
+    best, hits = counts.most_common(1)[0] if counts else (None, 0)
+    return overlay, best, hits
 
 
-# =====================
-# SAME UNIT ANALYSIS
-# =====================
-def analyze_same_units(draws, min_hits=5):
+def show_heatmap(matrix, rows, cols, labels=None, cmap="Reds", best=None, br=None, bc=None):
+    fig, ax = plt.subplots(figsize=(max(8, cols), max(5, rows)))
+    sns.heatmap(matrix, annot=labels if labels is not None else True,
+                fmt="d" if labels is not None else ".0f", cmap=cmap, ax=ax,
+                cbar=labels is None)
+    if best is not None:
+        ax.add_patch(plt.Rectangle((best[1], best[0]), bc, br,
+                                   fill=False, edgecolor="blue", linewidth=3))
+    st.pyplot(fig)
+    plt.close(fig)
 
-    # Grupa 1: 1,11,21,...71
-    # Grupa 2: 2,12,22,...72
-    # ...
-    # Grupa 0: 10,20,30,...80
 
-    groups = {
-        unit: list(range(unit, 81, 10))
-        for unit in range(1, 11)
-    }
-
-    # (grupa, tacan broj pogodaka) -> broj pojavljivanja
-    statistics = Counter()
-
-    # Poslednje pojavljivanje 5+ pogodaka
-    last_seen = {}
-
-    # Istorija svih dogadjaja sa 5+ pogodaka
+# ==============================================
+# ZAJEDNICKA STATISTIKA POGODAKA
+# ==============================================
+def count_hits(draws, selected, minimum=5):
+    picks = set(selected)
+    exact = Counter()
     events = []
+    last_seen = None
 
-    # Pretpostavka: draws[0] je najnovije izvlacenje
-    for draw_index, draw in enumerate(draws):
-
-        drawn_numbers = set(draw)
-
-        for unit, group_numbers in groups.items():
-
-            matched_numbers = sorted(
-                drawn_numbers.intersection(group_numbers)
-            )
-
-            hits = len(matched_numbers)
-
-            if hits >= min_hits:
-
-                statistics[(unit, hits)] += 1
-
-                # Prvo pronadjeno pojavljivanje je najnovije
-                if unit not in last_seen:
-                    last_seen[unit] = draw_index
-
-                events.append({
-                    "Izvlacenje": draw_index + 1,
-                    "Grupa": "0" if unit == 10 else str(unit),
-                    "Broj pogodaka": hits,
-                    "Pogodjeni brojevi": ", ".join(
-                        map(str, matched_numbers)
-                    )
-                })
-
-    return statistics, groups, last_seen, events
+    # draws su vec poredjani od najnovijeg ka najstarijem.
+    for index, item in enumerate(draws):
+        matched = sorted(picks & set(item["numbers"]))
+        hits = len(matched)
+        exact[hits] += 1
+        if hits >= minimum:
+            if last_seen is None:
+                last_seen = index
+            events.append({
+                "Izvlacenje (#1 najnovije)": index + 1,
+                "Datum i vreme": item["date"],
+                "Broj pogodaka": hits,
+                "Pogodjeni brojevi": ", ".join(map(str, matched)),
+            })
+    return exact, last_seen, events
 
 
-# =====================
-# STREAMLIT MAIN
-# =====================
+def parse_user_numbers(raw):
+    tokens = [p for p in re.split(r"[,;\s]+", raw.strip()) if p]
+    if not all(p.isdigit() for p in tokens):
+        raise ValueError("Koristi samo cele brojeve od 1 do 80, odvojene zarezom ili razmakom.")
+    numbers = [int(p) for p in tokens]
+    if not 5 <= len(numbers) <= 10:
+        raise ValueError("Unesi izmedju 5 i 10 brojeva.")
+    if len(set(numbers)) != len(numbers):
+        raise ValueError("Brojevi ne smeju da se ponavljaju.")
+    if not all(1 <= n <= 80 for n in numbers):
+        raise ValueError("Svi brojevi moraju biti od 1 do 80.")
+    return sorted(numbers)
+
+
+def show_event_table(events, filename):
+    if events:
+        data = pd.DataFrame(events)
+        st.dataframe(data, hide_index=True, use_container_width=True)
+        st.download_button("Preuzmi CSV", data=data.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=filename, mime="text/csv")
+    else:
+        st.info("Nema izvlacenja sa 5 ili vise pogodaka u ucitanom uzorku.")
+
+
+# ==============================================
+# APLIKACIJA
+# ==============================================
 st.title("🎯 Greek Kino Analyzer PRO")
+option = st.radio("Izaberi analizu:", (
+    "Kombinacije", "Heatmap analiza", "Vizuelni prikaz",
+    "Overlay + statistika", "Ista jedinica (5+ pogodaka)", "Moji brojevi (5-10)"
+))
 
-option = st.radio(
-    "Izaberi analizu:",
-    (
-        "Kombinacije",
-        "Heatmap analiza",
-        "Vizuelni prikaz",
-        "Overlay + statistika",
-        "Ista jedinica (5+ pogodaka)"
-    )
-)
+N = st.number_input("Broj poslednjih izvlacenja (N)",
+                    min_value=10, max_value=10000, value=200, step=50)
 
-N = st.number_input(
-    "Broj poslednjih izvlacenja",
-    min_value=10,
-    max_value=200,
-    value=50,
-    step=10
-)
+with st.spinner("Ucitavam istorijske rezultate..."):
+    draws, source, message = load_draws(int(N))
 
-with st.spinner("Ucitavam podatke..."):
-    draws = fetch_kino_results(
-        "https://grkino.com/arhiva.php",
-        int(N)
-    )
-
+if message:
+    st.warning(message)
 if not draws:
-    st.warning("Nema podataka ili podaci nisu ucitani.")
+    st.error("Nema validnih izvlačenja. Proveri internet vezu ili izvor podataka.")
     st.stop()
 
-st.success(f"Ucitano {len(draws)} izvlacenja.")
-
+st.caption(f"Izvor: {source} | Ucitano: {len(draws)} od trazenih {N} | "
+           f"Najnovije: {draws[0]['date']} | Najstarije: {draws[-1]['date']}")
 if len(draws) < N:
-    st.warning(
-        f"Trazeno je {N} izvlacenja, "
-        f"ali je pronadjeno samo {len(draws)}."
-    )
+    st.warning(f"Dostupno je samo {len(draws)} izvlačenja, iako si tražio {N}. "
+               "Sve statistike koriste stvarno ucitana izvlacenja.")
 
-
-# =====================
-# 1. KOMBINACIJE
-# =====================
 if option == "Kombinacije":
-
-    M = st.number_input(
-        "M (velicina kombinacije)",
-        min_value=2,
-        max_value=10,
-        value=5
-    )
-
-    K = st.number_input(
-        "K (min ponavljanja)",
-        min_value=1,
-        max_value=10,
-        value=1
-    )
-
-    if st.button("Analyze"):
-
-        result = analyze_kino(
-            draws,
-            int(M),
-            int(K)
-        )
-
-        if result:
-            for combo, count in sorted(
-                result,
-                key=lambda x: -x[1]
-            ):
-                st.write(combo, "->", count)
+    M = st.number_input("M (velicina kombinacije)", 2, 10, 5)
+    K = st.number_input("K (minimalan broj ponavljanja, iskljucivo veci od K)", 1, 20, 1)
+    operations = len(draws) * math.comb(20, M)
+    if operations > 8_000_000:
+        st.warning(f"Analiza bi zahtevala oko {operations:,} kombinacija. "
+                   "Smanji N ili M da aplikacija ne bi potrosila previse memorije.")
+    if st.button("Analiziraj kombinacije"):
+        if operations > 8_000_000:
+            st.error("Preveliki zahtev za ovu vrstu analize. Smanji N ili M.")
         else:
-            st.info("Nema kombinacija koje ispunjavaju uslov.")
+            results = analyze_kino(draws, M, K)
+            if results:
+                st.dataframe(pd.DataFrame([
+                    {"Kombinacija": ", ".join(map(str, c)), "Broj puta": cnt}
+                    for c, cnt in results
+                ]), hide_index=True, use_container_width=True)
+            else:
+                st.info("Nema kombinacija koje ispunjavaju uslov.")
 
-
-# =====================
-# 2. HEATMAP ANALIZA
-# =====================
 elif option == "Heatmap analiza":
+    rows = st.number_input("Redovi", 2, 20, 8)
+    cols = st.number_input("Kolone", 2, 20, 10)
+    br = st.number_input("Visina bloka", 1, rows, min(3, rows))
+    bc = st.number_input("Sirina bloka", 1, cols, min(3, cols))
+    if rows * cols < 80:
+        st.error("Matrica mora da ima najmanje 80 polja.")
+    elif st.button("Analiziraj heatmap"):
+        overlay, best, hits = matrix_analysis(draws, rows, cols, br, bc)
+        st.write(f"Najgusci blok ima ukupno {hits} pogodaka kroz sva izvlacenja.")
+        show_heatmap(overlay, rows, cols, best=best, br=br, bc=bc)
+        labels = np.arange(1, rows * cols + 1).reshape(rows, cols)
+        show_heatmap(labels, rows, cols, labels=labels, cmap="Greys", best=best, br=br, bc=bc)
 
-    rows = st.number_input(
-        "Redovi", 2, 20, 8
-    )
-
-    cols = st.number_input(
-        "Kolone", 2, 20, 10
-    )
-
-    br = st.number_input(
-        "Visina bloka", 1, int(rows), 3
-    )
-
-    bc = st.number_input(
-        "Sirina bloka", 1, int(cols), 3
-    )
-
-    if st.button("Analyze heatmap"):
-
-        if rows * cols < 80:
-            st.error(
-                "Matrica mora imati najmanje 80 polja."
-            )
-            st.stop()
-
-        (
-            heatmap_counts,
-            heatmap_numbers,
-            max_block,
-            max_hits
-        ) = matrix_analysis(
-            draws,
-            int(rows),
-            int(cols),
-            int(br),
-            int(bc)
-        )
-
-        fig, ax = plt.subplots(
-            figsize=(cols, rows)
-        )
-
-        sns.heatmap(
-            heatmap_counts,
-            annot=True,
-            fmt=".0f",
-            cmap="Reds",
-            ax=ax
-        )
-
-        if max_block is not None:
-
-            rect = plt.Rectangle(
-                (max_block[1], max_block[0]),
-                bc,
-                br,
-                fill=False,
-                edgecolor="blue",
-                linewidth=3
-            )
-
-            ax.add_patch(rect)
-
-            st.write(
-                f"Najgusci blok: {max_hits} pogodaka"
-            )
-
-        st.pyplot(fig)
-        plt.close(fig)
-
-        # Prikaz brojeva
-        fig2, ax2 = plt.subplots(
-            figsize=(cols, rows)
-        )
-
-        sns.heatmap(
-            heatmap_numbers,
-            annot=True,
-            fmt="d",
-            cmap="Greys",
-            ax=ax2
-        )
-
-        if max_block is not None:
-
-            rect2 = plt.Rectangle(
-                (max_block[1], max_block[0]),
-                bc,
-                br,
-                fill=False,
-                edgecolor="blue",
-                linewidth=3
-            )
-
-            ax2.add_patch(rect2)
-
-        st.pyplot(fig2)
-        plt.close(fig2)
-
-
-# =====================
-# 3. VIZUELNI PRIKAZ
-# =====================
 elif option == "Vizuelni prikaz":
-
-    rows = st.number_input(
-        "Redovi", 2, 20, 8
-    )
-
-    cols = st.number_input(
-        "Kolone", 2, 20, 10
-    )
-
+    rows = st.number_input("Redovi", 2, 20, 8)
+    cols = st.number_input("Kolone", 2, 20, 10)
     if rows * cols < 80:
-        st.error(
-            "Matrica mora imati najmanje 80 polja."
-        )
-        st.stop()
+        st.error("Matrica mora da ima najmanje 80 polja.")
+    else:
+        index = st.slider("Izvlacenje (1 = najnovije)", 1, len(draws), 1)
+        st.write("Datum i vreme:", draws[index - 1]["date"])
+        matrix = draw_single_matrix(draws[index - 1]["numbers"], rows, cols)
+        labels = np.arange(1, rows * cols + 1).reshape(rows, cols)
+        show_heatmap(matrix, rows, cols, labels=labels, cmap="Reds")
 
-    index = st.slider(
-        "Izvlacenje",
-        1,
-        len(draws),
-        1
-    )
-
-    matrix = draw_single_matrix(
-        draws[index - 1],
-        int(rows),
-        int(cols)
-    )
-
-    numbers = np.arange(
-        1, rows * cols + 1
-    ).reshape(rows, cols)
-
-    fig, ax = plt.subplots(
-        figsize=(cols, rows)
-    )
-
-    sns.heatmap(
-        matrix,
-        annot=numbers,
-        fmt="d",
-        cmap="Reds",
-        cbar=False,
-        ax=ax
-    )
-
-    st.pyplot(fig)
-    plt.close(fig)
-
-
-# =====================
-# 4. OVERLAY + STATISTIKA
-# =====================
 elif option == "Overlay + statistika":
-
-    rows = st.number_input(
-        "Redovi", 2, 20, 8
-    )
-
-    cols = st.number_input(
-        "Kolone", 2, 20, 10
-    )
-
+    rows = st.number_input("Redovi", 2, 20, 8)
+    cols = st.number_input("Kolone", 2, 20, 10)
     if rows * cols < 80:
-        st.error(
-            "Matrica mora imati najmanje 80 polja."
-        )
+        st.error("Matrica mora da ima najmanje 80 polja.")
+    else:
+        overlay = np.zeros((rows, cols))
+        for item in draws:
+            overlay += draw_single_matrix(item["numbers"], rows, cols)
+        labels = np.arange(1, rows * cols + 1).reshape(rows, cols)
+        show_heatmap(overlay, rows, cols, labels=labels, cmap="coolwarm")
+        a, b, c = st.columns(3)
+        a.metric("Max", int(overlay.max()))
+        b.metric("Min", int(overlay.min()))
+        c.metric("Prosek", f"{overlay.mean():.2f}")
+
+elif option == "Ista jedinica (5+ pogodaka)":
+    st.header("Statistika grupa sa istom jedinicom")
+    st.write("Grupa 1: 1, 11, ... 71; grupa 2: 2, 12, ... 72; ... grupa 0: 10, 20, ... 80.")
+
+    detailed = []
+    summary = []
+    history = []
+    for unit in range(1, 11):
+        nums = list(range(unit, 81, 10))
+        group = "0" if unit == 10 else str(unit)
+        exact, last_seen, events = count_hits(draws, nums, minimum=5)
+        total = sum(exact[h] for h in range(5, 9))
+        for hits in range(5, 9):
+            detailed.append({"Grupa": group, "Brojevi": ", ".join(map(str, nums)),
+                             "Tacno pogodaka": hits, "Broj puta": exact[hits]})
+        summary.append({
+            "Grupa": group, "Brojevi": ", ".join(map(str, nums)),
+            "5 pogodaka": exact[5], "6 pogodaka": exact[6],
+            "7 pogodaka": exact[7], "8 pogodaka": exact[8],
+            "Ukupno 5+": total,
+            "Udeo (%)": round(100 * total / len(draws), 2),
+            "Proslo izvlacenja": last_seen if last_seen is not None else "Nije bilo",
+        })
+        for event in events:
+            history.append({"Grupa": group, **event})
+
+    df_detailed = pd.DataFrame(detailed)
+    df_summary = pd.DataFrame(summary).sort_values("Ukupno 5+", ascending=False)
+
+    st.subheader("Tacno 5, 6, 7 ili 8 pogodaka")
+    if st.checkbox("Samo redovi sa najmanje jednim pojavljivanjem", value=True):
+        df_detailed = df_detailed[df_detailed["Broj puta"] > 0]
+    st.dataframe(df_detailed, hide_index=True, use_container_width=True)
+
+    st.subheader("Rang-lista grupa")
+    st.dataframe(df_summary, hide_index=True, use_container_width=True)
+    st.caption("Proslo izvlacenja: 0 znaci najnovije izvlacenje. "
+               "'Nije bilo' znaci da nije pronadjen nijedan slucaj sa 5+ u uzorku.")
+
+    st.subheader("Grafikon pogodaka po grupama")
+    chart = pd.DataFrame(summary).set_index("Grupa")[
+        ["5 pogodaka", "6 pogodaka", "7 pogodaka", "8 pogodaka"]]
+    st.bar_chart(chart)
+
+    st.subheader("Istorija izvlačenja sa 5+ pogodaka")
+    history.sort(key=lambda x: x["Izvlacenje (#1 najnovije)"])
+    show_event_table(history, "kino_iste_jedinice.csv")
+
+elif option == "Moji brojevi (5-10)":
+    st.header("Statistika za tvoje brojeve")
+    raw = st.text_input("Unesi 5 do 10 razlicitih brojeva (1-80)",
+                        value="1, 11, 21, 31, 41, 51, 61, 71",
+                        help="Brojeve odvoji zarezom, razmakom ili tacka-zarezom.")
+    try:
+        selected = parse_user_numbers(raw)
+    except ValueError as e:
+        st.error(str(e))
         st.stop()
 
-    overlay = np.zeros((rows, cols))
-
-    for draw in draws:
-        for num in draw:
-
-            r, c = number_to_matrix_pos(
-                num,
-                int(rows),
-                int(cols)
-            )
-
-            overlay[r, c] += 1
-
-    numbers = np.arange(
-        1, rows * cols + 1
-    ).reshape(rows, cols)
-
-    fig, ax = plt.subplots(
-        figsize=(cols, rows)
-    )
-
-    sns.heatmap(
-        overlay,
-        annot=numbers,
-        fmt="d",
-        cmap="coolwarm",
-        ax=ax
-    )
-
-    st.pyplot(fig)
-    plt.close(fig)
-
-    st.write("📊 Statistika:")
-
-    st.write("Max:", int(np.max(overlay)))
-    st.write("Min:", int(np.min(overlay)))
-    st.write("Prosek:", float(np.mean(overlay)))
-
-
-# =====================
-# 5. ISTA JEDINICA - 5+ POGODAKA
-# =====================
-elif option == "Ista jedinica (5+ pogodaka)":
-
-    st.header("📊 Statistika brojeva sa istom jedinicom")
-
-    st.write(
-        "Analiza grupa brojeva koji imaju istu jedinicu, "
-        "sa najmanje 5 pogodaka u jednom izvlacenju."
-    )
-
-    (
-        statistics,
-        groups,
-        last_seen,
-        events
-    ) = analyze_same_units(
-        draws,
-        min_hits=5
-    )
-
-    total_draws = len(draws)
-
-    # =====================
-    # DETALJNA STATISTIKA
-    # =====================
-    st.subheader("1. Broj pogodaka i broj pojavljivanja")
-
-    detailed_data = []
-
-    for unit, numbers in groups.items():
-
-        group_label = ", ".join(
-            map(str, numbers)
-        )
-
-        for hits in range(5, 9):
-
-            count = statistics.get(
-                (unit, hits),
-                0
-            )
-
-            detailed_data.append({
-                "Grupa": group_label,
-                "Broj pogodaka": hits,
-                "Broj puta": count
-            })
-
-    df_detailed = pd.DataFrame(
-        detailed_data
-    )
-
-    show_only_hits = st.checkbox(
-        "Prikazi samo rezultate koji su se pojavili",
-        value=True
-    )
-
-    if show_only_hits:
-        df_detailed = df_detailed[
-            df_detailed["Broj puta"] > 0
-        ]
-
-    if not df_detailed.empty:
-
-        st.dataframe(
-            df_detailed,
-            use_container_width=True,
-            hide_index=True
-        )
-
-    else:
-        st.info(
-            "Nema pojavljivanja sa 5 ili vise pogodaka."
-        )
-
-    # =====================
-    # SUMARNA STATISTIKA
-    # =====================
-    st.subheader("2. Ukupna statistika po grupama")
-
-    summary_data = []
-
-    for unit, numbers in groups.items():
-
-        counts = {
-            hits: statistics.get(
-                (unit, hits),
-                0
-            )
-            for hits in range(5, 9)
-        }
-
-        total = sum(counts.values())
-
-        percentage = (
-            total / total_draws * 100
-            if total_draws > 0
-            else 0
-        )
-
-        # Broj izvlacenja od poslednjeg pojavljivanja
-        if unit in last_seen:
-            last_occurrence = last_seen[unit]
-        else:
-            last_occurrence = None
-
-        summary_data.append({
-            "Grupa": (
-                "0" if unit == 10 else str(unit)
-            ),
-            "Brojevi": ", ".join(
-                map(str, numbers)
-            ),
-            "5 pogodaka": counts[5],
-            "6 pogodaka": counts[6],
-            "7 pogodaka": counts[7],
-            "8 pogodaka": counts[8],
-            "Ukupno 5+": total,
-            "Udeo (%)": round(percentage, 2),
-            "Proslo izvlacenja": (
-                last_occurrence
-                if last_occurrence is not None
-                else "-"
-            )
-        })
-
-    df_summary = pd.DataFrame(
-        summary_data
-    )
-
-    df_summary = df_summary.sort_values(
-        by="Ukupno 5+",
-        ascending=False
-    )
-
-    st.dataframe(
-        df_summary,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.caption(
-        "'Proslo izvlacenja' oznacava koliko je "
-        "izvlacenja proslo od poslednjeg pojavljivanja "
-        "5+ pogodaka. Vrednost 0 znaci da se dogodilo "
-        "u najnovijem izvlacenju. "
-        "Izvlacenja se posmatraju redosledom "
-        "kojim ih vraca arhiva, od najnovijeg."
-    )
-
-    # =====================
-    # UKUPNI REZULTATI
-    # =====================
-    st.subheader("3. Ukupni rezultati")
-
-    total_5 = sum(
-        statistics.get((unit, 5), 0)
-        for unit in groups
-    )
-
-    total_6 = sum(
-        statistics.get((unit, 6), 0)
-        for unit in groups
-    )
-
-    total_7 = sum(
-        statistics.get((unit, 7), 0)
-        for unit in groups
-    )
-
-    total_8 = sum(
-        statistics.get((unit, 8), 0)
-        for unit in groups
-    )
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric("5 pogodaka", total_5)
-    col2.metric("6 pogodaka", total_6)
-    col3.metric("7 pogodaka", total_7)
-    col4.metric("8 pogodaka", total_8)
-
-    st.info(
-        f"Ukupno evidentirano {len(events)} "
-        f"pojavljivanja grupa sa 5+ pogodaka "
-        f"u poslednjih {total_draws} izvlacenja."
-    )
-
-    # =====================
-    # GRAFIKON PO GRUPAMA
-    # =====================
-    st.subheader("4. Grafikon ucestalosti po grupama")
-
-    labels = []
-    values = []
-
-    for unit in groups:
-
-        label = "0" if unit == 10 else str(unit)
-
-        total = sum(
-            statistics.get((unit, hits), 0)
-            for hits in range(5, 9)
-        )
-
-        labels.append(label)
-        values.append(total)
-
-    fig, ax = plt.subplots(
-        figsize=(11, 5)
-    )
-
-    bars = ax.bar(
-        labels,
-        values,
-        color="steelblue",
-        edgecolor="black"
-    )
-
-    ax.set_xlabel("Grupa / poslednja cifra")
-    ax.set_ylabel("Broj pojavljivanja")
-    ax.set_title(
-        "Broj izvlacenja sa 5+ pogodaka po grupama"
-    )
-
-    ax.bar_label(
-        bars,
-        padding=3
-    )
-
-    ax.set_ylim(
-        0,
-        max(values, default=0) + 2
-    )
-
-    ax.grid(
-        axis="y",
-        alpha=0.3
-    )
-
-    st.pyplot(fig)
-    plt.close(fig)
-
-    # =====================
-    # GRAFIKON 5, 6, 7, 8
-    # =====================
-    st.subheader("5. Raspodela broja pogodaka")
-
-    hit_labels = ["5", "6", "7", "8"]
-
-    hit_values = [
-        total_5,
-        total_6,
-        total_7,
-        total_8
-    ]
-
-    fig2, ax2 = plt.subplots(
-        figsize=(9, 4)
-    )
-
-    bars2 = ax2.bar(
-        hit_labels,
-        hit_values,
-        color="coral",
-        edgecolor="black"
-    )
-
-    ax2.set_xlabel("Broj pogodaka")
-    ax2.set_ylabel("Broj pojavljivanja")
-    ax2.set_title(
-        "Ukupna raspodela 5, 6, 7 i 8 pogodaka"
-    )
-
-    ax2.bar_label(
-        bars2,
-        padding=3
-    )
-
-    ax2.set_ylim(
-        0,
-        max(hit_values, default=0) + 2
-    )
-
-    ax2.grid(
-        axis="y",
-        alpha=0.3
-    )
-
-    st.pyplot(fig2)
-    plt.close(fig2)
-
-    # =====================
-    # ISTORIJA POGODAKA
-    # =====================
-    st.subheader("6. Istorija svih 5+ pogodaka")
-
-    st.write(
-        "Prikaz svih izvlacenja u kojima je "
-        "neka grupa imala najmanje 5 pogodaka."
-    )
-
-    if events:
-
-        df_events = pd.DataFrame(events)
-
-        st.dataframe(
-            df_events,
-            use_container_width=True,
-            hide_index=True
-        )
-
-        csv = df_events.to_csv(
-            index=False
-        ).encode("utf-8-sig")
-
-        st.download_button(
-            label="Preuzmi istoriju kao CSV",
-            data=csv,
-            file_name="kino_same_unit_history.csv",
-            mime="text/csv"
-        )
-
-    else:
-        st.info(
-            "Nema izvlacenja sa 5+ pogodaka."
-        )
-
-    # =====================
-    # NAJCESCA GRUPA
-    # =====================
-    st.subheader("7. Najcesca grupa")
-
-    best_group = df_summary.iloc[0]
-
-    if best_group["Ukupno 5+"] > 0:
-
-        st.success(
-            f"Najcesca grupa: {best_group['Grupa']} "
-            f"({best_group['Brojevi']})"
-        )
-
-        st.write(
-            f"Ukupno pojavljivanja sa 5+ pogodaka: "
-            f"{best_group['Ukupno 5+']}"
-        )
-
-        st.write(
-            f"Udeo u analiziranim izvlacenjima: "
-            f"{best_group['Udeo (%)']}%"
-        )
-
-    else:
-        st.info(
-            "Nijedna grupa nije imala 5+ pogodaka."
-        )
+    st.write("Izabrani brojevi:", ", ".join(map(str, selected)))
+    exact, last_seen, events = count_hits(draws, selected, minimum=5)
+    total = len(events)
+    a, b, c = st.columns(3)
+    a.metric("Ukupno 5+", total)
+    b.metric("Udeo izvlačenja sa 5+", f"{100 * total / len(draws):.2f}%")
+    c.metric("Proslo od poslednjeg 5+", last_seen if last_seen is not None else "Nije bilo")
+
+    st.subheader("Koliko puta je bilo tacno 5, 6, ... pogodaka")
+    table = pd.DataFrame([
+        {"Broj pogodaka": h, "Broj puta": exact[h],
+         "Udeo (%)": round(100 * exact[h] / len(draws), 2)}
+        for h in range(5, len(selected) + 1)
+    ])
+    st.dataframe(table, hide_index=True, use_container_width=True)
+    st.bar_chart(table.set_index("Broj pogodaka")["Broj puta"])
+
+    with st.expander("Kompletna raspodela (0 do broja izabranih brojeva)"):
+        all_hits = pd.DataFrame([
+            {"Broj pogodaka": h, "Broj puta": exact[h]}
+            for h in range(len(selected) + 1)
+        ])
+        st.dataframe(all_hits, hide_index=True, use_container_width=True)
+
+    st.subheader("Istorija svih izvlačenja sa 5+ pogodaka")
+    show_event_table(events, "kino_moji_brojevi.csv")
+
+st.caption("Istorijska ucestalost ne predvidja naredno nezavisno KINO izvlacenje.")
